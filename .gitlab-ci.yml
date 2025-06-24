@@ -1,0 +1,284 @@
+workflow:
+  rules:
+    - when: never
+
+stages:
+  - test
+  - build
+  - security
+  - deploy
+
+variables:
+  # GitLab Container Registry variables
+  REGISTRY_URL: $CI_REGISTRY
+  REGISTRY_IMAGE: $CI_REGISTRY_IMAGE
+  BACKEND_IMAGE: $CI_REGISTRY_IMAGE/backend
+  FRONTEND_IMAGE: $CI_REGISTRY_IMAGE/frontend
+
+  # Environment variables
+  NEXT_PUBLIC_API_URL: https://gearment-be.minhviet.xyz/api
+
+  # Docker build arguments
+  DOCKER_BUILDKIT: 1
+  DOCKER_DRIVER: overlay2
+
+# Global cache configuration for faster builds
+# This cache is shared across all jobs and invalidated when lock files change
+cache:
+  key:
+    files:
+      - backend/pnpm-lock.yaml
+      - frontend/pnpm-lock.yaml
+  paths:
+    - backend/node_modules/
+    - frontend/node_modules/
+    - backend/.pnpm-store/
+    - frontend/.pnpm-store/
+    - .pnpm-store/
+    - backend/.cache/
+    - frontend/.cache/
+    - backend/dist/
+    - frontend/.next/
+
+# Debug job to check if pipeline is triggered
+debug-pipeline:
+  stage: test
+  image: alpine:latest
+  script:
+    - |
+      echo "Pipeline triggered successfully!"
+      echo "Branch: $CI_COMMIT_REF_NAME"
+      echo "Commit SHA: $CI_COMMIT_SHA"
+      echo "Project: $CI_PROJECT_NAME"
+      echo "User: $GITLAB_USER_NAME"
+      echo "=== Cache Debug Info ==="
+      echo "Cache directory: /cache"
+      ls -la /cache || echo "Cache directory not found"
+      echo "=== End Cache Debug ==="
+  only:
+    - main
+    - master
+    - develop
+    - merge_requests
+
+# Test Backend
+test-backend:
+  stage: test
+  image: node:18-alpine
+  cache:
+    key:
+      files:
+        - backend/pnpm-lock.yaml
+    paths:
+      - backend/node_modules/
+      - backend/.pnpm-store/
+      - backend/.cache/
+    policy: pull
+  before_script:
+    - cd backend
+    - npm install -g pnpm
+    - pnpm install --frozen-lockfile
+  script:
+    - echo "Running backend tests..."
+    - pnpm run test:coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: backend/coverage/cobertura-coverage.xml
+    paths:
+      - backend/coverage/
+    expire_in: 1 week
+  only:
+    - main
+    - master
+    - develop
+    - merge_requests
+
+# Test Frontend
+test-frontend:
+  stage: test
+  image: node:18-alpine
+  cache:
+    key: 
+      files:
+        - frontend/pnpm-lock.yaml
+    paths:
+      - frontend/node_modules/
+      - frontend/.pnpm-store/
+      - frontend/.cache/
+    policy: pull
+  before_script:
+    - cd frontend
+    - npm install -g pnpm
+    - pnpm install --frozen-lockfile
+  script:
+    - echo "Running frontend tests..."
+    - pnpm run test:coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: frontend/coverage/cobertura-coverage.xml
+    paths:
+      - frontend/coverage/
+    expire_in: 1 week
+  only:
+    - main
+    - master
+    - develop
+    - merge_requests
+
+# Build Backend Docker Image (only if tests pass)
+build-backend:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_BUILDKIT: 1
+  cache:
+    key: "docker-backend-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .docker-cache/
+    policy: pull-push
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - mkdir -p .docker-cache
+  script:
+    - echo "Building backend Docker image..."
+    - docker build --cache-from $BACKEND_IMAGE:latest --build-arg BUILDKIT_INLINE_CACHE=1 -t $BACKEND_IMAGE:$CI_COMMIT_SHA -t $BACKEND_IMAGE:latest ./backend
+    - docker push $BACKEND_IMAGE:$CI_COMMIT_SHA
+    - docker push $BACKEND_IMAGE:latest
+  only:
+    - main
+    - master
+    - develop
+    - merge_requests
+  dependencies:
+    - test-backend
+
+# Build Frontend Docker Image (only if tests pass)
+build-frontend:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_BUILDKIT: 1
+  cache:
+    key: "docker-frontend-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .docker-cache/
+    policy: pull-push
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - mkdir -p .docker-cache
+  script:
+    - echo "Building frontend Docker image..."
+    - docker build --cache-from $FRONTEND_IMAGE:latest --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL --build-arg NODE_ENV=production -t $FRONTEND_IMAGE:$CI_COMMIT_SHA -t $FRONTEND_IMAGE:latest ./frontend
+    - docker push $FRONTEND_IMAGE:$CI_COMMIT_SHA
+    - docker push $FRONTEND_IMAGE:latest
+  only:
+    - main
+    - master
+    - develop
+    - merge_requests
+  dependencies:
+    - test-frontend
+
+# Deploy to Development Environment
+deploy-dev:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache docker-compose
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - |
+      echo "Deploying to development environment..."
+      echo "Using images: $BACKEND_IMAGE:$CI_COMMIT_SHA and $FRONTEND_IMAGE:$CI_COMMIT_SHA"
+      echo "Deployment commands would go here"
+      echo "For example, updating docker-compose files or deploying to a dev server"
+  environment:
+    name: development
+    url: https://dev.gearment.example.com
+  only:
+    - develop
+  when: on_success
+  dependencies:
+    - build-backend
+    - build-frontend
+    - security-scan
+
+# Deploy to Production Environment
+deploy-prod:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache docker-compose
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - |
+      echo "Deploying to production environment..."
+      echo "Using images: $BACKEND_IMAGE:$CI_COMMIT_SHA and $FRONTEND_IMAGE:$CI_COMMIT_SHA"
+      echo "Production deployment commands would go here"
+  environment:
+    name: production
+    url: https://gearment.example.com
+  only:
+    - main
+    - master
+  when: on_success
+  dependencies:
+    - build-backend
+    - build-frontend
+    - security-scan
+
+# Security scanning
+security-scan:
+  stage: security
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    # Install Trivy for vulnerability scanning
+    - apk add --no-cache curl
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.48.0
+  script:
+    - echo "Running security scan on Docker images..."
+    - docker pull $BACKEND_IMAGE:$CI_COMMIT_SHA
+    - docker pull $FRONTEND_IMAGE:$CI_COMMIT_SHA
+
+    # Scan backend image for vulnerabilities
+    - echo "Scanning backend image for vulnerabilities..."
+    - trivy image --severity HIGH,CRITICAL --exit-code 1 $BACKEND_IMAGE:$CI_COMMIT_SHA || echo "Vulnerabilities found in backend image"
+
+    # Scan frontend image for vulnerabilities
+    - echo "Scanning frontend image for vulnerabilities..."
+    - trivy image --severity HIGH,CRITICAL --exit-code 1 $FRONTEND_IMAGE:$CI_COMMIT_SHA || echo "Vulnerabilities found in frontend image"
+
+    # Basic image analysis
+    - echo "Analyzing image sizes..."
+    - docker images $BACKEND_IMAGE:$CI_COMMIT_SHA
+    - docker images $FRONTEND_IMAGE:$CI_COMMIT_SHA
+
+    - echo "Security scan completed successfully"
+  artifacts:
+    paths:
+      - security-report.json
+    expire_in: 1 week
+  only:
+    - main
+    - master
+    - develop
+  dependencies:
+    - build-backend
+    - build-frontend

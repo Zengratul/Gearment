@@ -1,0 +1,237 @@
+kind: pipeline
+type: docker
+name: Deployment
+
+# Global environment variables
+environment:
+  REGISTRY_URL: ghcr.io
+  DOCKER_BUILDKIT: 1
+  NEXT_PUBLIC_API_URL: https://gearment-be.minhviet.xyz/api
+
+# Disable default clone to use custom clone step
+clone:
+  disable: false
+
+steps:
+  # Debug step to show pipeline information
+  - name: Show Pipeline Information
+    image: alpine:latest
+    commands:
+      - echo "=== Drone CI Pipeline Debug ==="
+      - 'echo "Build number: $DRONE_BUILD_NUMBER"'
+      - 'echo "Branch: $DRONE_BRANCH"'
+      - 'echo "Commit SHA: $DRONE_COMMIT_SHA"'
+      - 'echo "Repository: $DRONE_REPO"'
+      - 'echo "Author: $DRONE_COMMIT_AUTHOR"'
+      - 'echo "Event: $DRONE_BUILD_EVENT"'
+      - 'echo "Registry URL: $REGISTRY_URL"'
+      - 'echo "API URL: $NEXT_PUBLIC_API_URL"'
+      - echo "============================="
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+        - pull_request
+
+  # Test Backend
+  - name: Test Backend
+    image: node:20-alpine
+    environment:
+      PNPM_HOME: /pnpm
+    commands:
+      - set -euxo pipefail
+      - export PATH="$PNPM_HOME:$PATH"
+      - echo "PATH=$PATH"
+      - corepack enable
+      - corepack prepare pnpm@latest --activate
+      - pnpm --version
+      - pnpm config set store-dir /pnpm-store
+      - pnpm config set enable-pre-post-scripts true
+      - cd backend
+      - pnpm install --frozen-lockfile
+      - pnpm run test:coverage
+    when:
+      branch: [main, master, dev]
+      event: [push, pull_request]
+
+  # Test Frontend
+  - name: Test Frontend
+    image: node:20-alpine
+    environment:
+      PNPM_HOME: /pnpm
+    commands:
+      - set -euxo pipefail
+      - export PATH="$PNPM_HOME:$PATH"
+      - corepack enable
+      - corepack prepare pnpm@latest --activate
+      - pnpm --version
+      - pnpm config set store-dir /pnpm-store
+      - pnpm config set enable-pre-post-scripts true
+      - cd frontend
+      - pnpm install --frozen-lockfile
+      - pnpm run test:coverage
+    when:
+      branch: [main, master, dev]
+      event: [push, pull_request]
+
+  # Build Backend Docker Image
+  - name: Build Backend
+    image: plugins/docker
+    settings:
+      registry: ghcr.io
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+      repo: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend
+      context: ./backend
+      dockerfile: ./backend/Dockerfile
+      tags:
+        - latest
+        - ${DRONE_COMMIT_SHA:0:8}
+        - ${DRONE_BRANCH}
+        - buildcache
+      cache_from:
+        - ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:buildcache
+      build_args:
+        - BUILDKIT_INLINE_CACHE=1
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+        - pull_request
+    depends_on:
+      - Test Backend
+
+  # Build Frontend Docker Image
+  - name: Build Frontend
+    image: plugins/docker
+    settings:
+      registry: ghcr.io
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+      repo: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend
+      context: ./frontend
+      dockerfile: ./frontend/Dockerfile
+      tags:
+        - latest
+        - ${DRONE_COMMIT_SHA:0:8}
+        - ${DRONE_BRANCH}
+        - buildcache
+      cache_from:
+        - ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:buildcache
+      build_args:
+        - BUILDKIT_INLINE_CACHE=1
+        - NEXT_PUBLIC_API_URL=https://gearment-be.minhviet.xyz/api
+        - NODE_ENV=production
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+        - pull_request
+    depends_on:
+      - Test Frontend
+
+  # Security scanning with Trivy
+  - name: Security Scan
+    image: aquasec/trivy:latest
+    environment:
+      GHCR_USERNAME:
+        from_secret: ghcr_username
+      GHCR_TOKEN:
+        from_secret: ghcr_token
+    commands:
+      - echo "Starting security scan..."
+      - echo "Scanning backend image for vulnerabilities..."
+      - trivy image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --username "$GHCR_USERNAME" --password "$GHCR_TOKEN" ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8} || true
+      - echo "Scanning frontend image for vulnerabilities..."
+      - trivy image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --username "$GHCR_USERNAME" --password "$GHCR_TOKEN" ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8} || true
+      - echo "Security scan completed"
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+    depends_on:
+      - Build Backend
+      - Build Frontend
+
+  - name: Deployment
+    image: curlimages/curl:8.7.1
+    environment:
+      WATCHTOWER_HTTP_API_TOKEN:
+        from_secret: watchtower_token
+    commands:
+      - echo "Triggering Watchtower to update production containers..."
+      - 'echo "New backend image: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8}"'
+      - 'echo "New frontend image: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8}"'
+      - echo "Testing connectivity to Watchtower endpoint..."
+      - nslookup watch.minhviet.xyz || echo "DNS lookup failed"
+      - ping -c 3 watch.minhviet.xyz || echo "Ping failed"
+      - echo "Attempting Watchtower API call with enhanced curl options..."
+      - |
+        curl --fail --silent --show-error --location \
+          --max-time 60 \
+          --connect-timeout 30 \
+          --retry 3 \
+          --retry-delay 5 \
+          --retry-max-time 180 \
+          -X POST \
+          -H "Authorization: Bearer $WATCHTOWER_HTTP_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -H "User-Agent: Drone-CI/1.0" \
+          https://watch.minhviet.xyz/v1/update
+      - echo "Watchtower update trigger sent successfully"
+    when:
+      branch:
+        - main
+        - master
+      event:
+        - push
+    depends_on:
+      - Build Backend
+      - Build Frontend
+      - Security Scan
+
+# Trigger conditions
+trigger:
+  branch:
+    - main
+    - master
+    - dev
+  event:
+    - push
+    - pull_request
+
+---
+# Pipeline for cleanup old images
+kind: pipeline
+type: docker
+name: Cleanup
+
+steps:
+  - name: cleanup-old-images
+    image: alpine:latest
+    commands:
+      - echo "Cleaning up old Docker images..."
+      - echo "This step would clean up old images from registry"
+      - echo "Implementation depends on your registry type"
+
+trigger:
+  event:
+    - cron
+  cron:
+    - cleanup

@@ -1,0 +1,434 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Add permissions block for container registry access and security events
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+env:
+  REGISTRY_URL: ghcr.io
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+  NEXT_PUBLIC_API_URL: https://gearment-be.minhviet.xyz/api
+  DOCKER_BUILDKIT: 1
+  DOCKER_DRIVER: overlay2
+
+jobs:
+  # Debug job to check if workflow is triggered
+  debug-pipeline:
+    runs-on: [self-hosted]
+    steps:
+      - name: Debug Pipeline
+        run: |
+          echo "Pipeline triggered successfully!"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Event: ${{ github.event_name }}"
+          echo ""
+          echo "Environment Variables:"
+          echo "REGISTRY_URL: ${{ env.REGISTRY_URL }}"
+          echo "REGISTRY_IMAGE: ${{ env.REGISTRY_IMAGE }}"
+          echo "BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}"
+          echo "FRONTEND_IMAGE: ${{ env.FRONTEND_IMAGE }}"
+          echo "NEXT_PUBLIC_API_URL: ${{ env.NEXT_PUBLIC_API_URL }}"
+          echo "DOCKER_BUILDKIT: ${{ env.DOCKER_BUILDKIT }}"
+          echo "DOCKER_DRIVER: ${{ env.DOCKER_DRIVER }}"
+
+  # Test Backend
+  test-backend:
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: latest
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-backend-${{ hashFiles('backend/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-backend-
+
+      - name: Check lock files exist
+        run: |
+          echo "Checking for lock files..."
+          ls -la backend/pnpm-lock.yaml || echo "Backend pnpm-lock.yaml not found"
+          ls -la frontend/pnpm-lock.yaml || echo "Frontend pnpm-lock.yaml not found"
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests with coverage
+        working-directory: ./backend
+        run: pnpm run test:coverage
+
+      - name: Check coverage files
+        run: |
+          echo "Checking coverage files..."
+          ls -la backend/coverage/ || echo "No coverage directory found"
+          find backend/coverage/ -name "*.xml" -o -name "*.json" || echo "No coverage files found"
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./backend/coverage/cobertura-coverage.xml
+          flags: backend
+          name: backend-coverage
+        if: hashFiles('backend/coverage/cobertura-coverage.xml') != ''
+
+  # Test Frontend
+  test-frontend:
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: latest
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-frontend-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-frontend-
+
+      - name: Check lock files exist
+        run: |
+          echo "Checking for lock files..."
+          ls -la backend/pnpm-lock.yaml || echo "Backend pnpm-lock.yaml not found"
+          ls -la frontend/pnpm-lock.yaml || echo "Frontend pnpm-lock.yaml not found"
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests with coverage
+        working-directory: ./frontend
+        run: pnpm run test:coverage
+
+      - name: Check coverage files
+        run: |
+          echo "Checking coverage files..."
+          ls -la frontend/coverage/ || echo "No coverage directory found"
+          find frontend/coverage/ -name "*.xml" -o -name "*.json" || echo "No coverage files found"
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./frontend/coverage/cobertura-coverage.xml
+          flags: frontend
+          name: frontend-coverage
+        if: hashFiles('frontend/coverage/cobertura-coverage.xml') != ''
+
+  # Build Backend Docker Image
+  build-backend:
+    runs-on: [self-hosted]
+    needs: test-backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image names
+        run: |
+          echo "BACKEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/backend" >> $GITHUB_ENV
+          echo "FRONTEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/frontend" >> $GITHUB_ENV
+
+      - name: Debug build environment
+        run: |
+          echo "Repository: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Backend image: ${{ env.BACKEND_IMAGE }}"
+          echo "Working directory: $(pwd)"
+          ls -la backend/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Debug metadata
+        run: |
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+          echo "Labels: ${{ steps.meta.outputs.labels }}"
+
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: Verify backend image was pushed
+        run: |
+          echo "Verifying backend image was pushed..."
+          echo "Waiting for image to be available..."
+          sleep 10
+          docker pull ${{ env.BACKEND_IMAGE }}:latest || echo "Backend image not found after push"
+          echo "Backend image verification completed"
+
+  # Build Frontend Docker Image
+  build-frontend:
+    runs-on: [self-hosted]
+    needs: test-frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image names
+        run: |
+          echo "BACKEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/backend" >> $GITHUB_ENV
+          echo "FRONTEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/frontend" >> $GITHUB_ENV
+
+      - name: Debug build environment
+        run: |
+          echo "Repository: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Frontend image: ${{ env.FRONTEND_IMAGE }}"
+          echo "Working directory: $(pwd)"
+          ls -la frontend/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Debug metadata
+        run: |
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+          echo "Labels: ${{ steps.meta.outputs.labels }}"
+
+  # Security scanning
+  security-scan:
+    runs-on: [self-hosted]
+    needs: [build-backend, build-frontend]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image names
+        run: |
+          echo "BACKEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/backend" >> $GITHUB_ENV
+          echo "FRONTEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/frontend" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Debug image names
+        run: |
+          echo "Backend image: ${{ env.BACKEND_IMAGE }}:latest"
+          echo "Frontend image: ${{ env.FRONTEND_IMAGE }}:latest"
+          echo "Repository: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+
+      - name: Validate image names
+        run: |
+          echo "Validating image names..."
+          BACKEND_IMG="${{ env.BACKEND_IMAGE }}:latest"
+          FRONTEND_IMG="${{ env.FRONTEND_IMAGE }}:latest"
+
+          # Check if image names contain invalid characters
+          if [[ "$BACKEND_IMG" =~ [^a-zA-Z0-9._/-:] ]]; then
+            echo "Warning: Backend image name contains invalid characters"
+            echo "Backend image: $BACKEND_IMG"
+          else
+            echo "Backend image name is valid: $BACKEND_IMG"
+          fi
+
+          if [[ "$FRONTEND_IMG" =~ [^a-zA-Z0-9._/-:] ]]; then
+            echo "Warning: Frontend image name contains invalid characters"
+            echo "Frontend image: $FRONTEND_IMG"
+          else
+            echo "Frontend image name is valid: $FRONTEND_IMG"
+          fi
+
+      - name: Wait for images to be available
+        run: |
+          echo "Waiting for images to be available in registry..."
+          echo "This step ensures images are fully pushed before scanning"
+          sleep 30
+
+      - name: Pull backend image for scanning
+        run: |
+          echo "Pulling backend image for scanning..."
+          docker pull ${{ env.BACKEND_IMAGE }}:latest
+          echo "Backend image pulled successfully"
+
+      - name: Pull frontend image for scanning
+        run: |
+          echo "Pulling frontend image for scanning..."
+          docker pull ${{ env.FRONTEND_IMAGE }}:latest
+          echo "Frontend image pulled successfully"
+
+      - name: Run Trivy vulnerability scanner for backend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.BACKEND_IMAGE }}:latest'
+          format: 'sarif'
+          output: 'trivy-results-backend.sarif'
+        continue-on-error: true
+
+      - name: Run Trivy vulnerability scanner for frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.FRONTEND_IMAGE }}:latest'
+          format: 'sarif'
+          output: 'trivy-results-frontend.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy scan results to GitHub Security tab (Backend)
+        uses: github/codeql-action/upload-sarif@v2
+        if: always() && hashFiles('trivy-results-backend.sarif') != ''
+        with:
+          sarif_file: 'trivy-results-backend.sarif'
+          category: trivy-backend
+
+      - name: Upload Trivy scan results to GitHub Security tab (Frontend)
+        uses: github/codeql-action/upload-sarif@v2
+        if: always() && hashFiles('trivy-results-frontend.sarif') != ''
+        with:
+          sarif_file: 'trivy-results-frontend.sarif'
+          category: trivy-frontend
+
+      - name: Analyze image sizes
+        run: |
+          echo "Analyzing Docker image sizes..."
+          docker pull ${{ env.BACKEND_IMAGE }}:latest || echo "Backend image not found"
+          docker pull ${{ env.FRONTEND_IMAGE }}:latest || echo "Frontend image not found"
+          docker images | grep -E "(backend|frontend)" || echo "No images found"
+
+  # Deploy to Production Environment
+  deploy-prod:
+    runs-on: [self-hosted]
+    needs: [build-backend, build-frontend, security-scan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image names
+        run: |
+          echo "BACKEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/backend" >> $GITHUB_ENV
+          echo "FRONTEND_IMAGE=ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')/frontend" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Deploy Backend to Production
+        run: |
+          echo "Deploying backend to production environment..."
+          echo "Backend image: ${{ env.BACKEND_IMAGE }}:latest"
+
+          # Pull the latest backend image
+          docker pull ${{ env.BACKEND_IMAGE }}:latest
+
+          # Deploy backend (example commands - modify as needed)
+          # docker run -d --name gearment-backend-prod \
+          #   -p 3000:3000 \
+          #   -e NODE_ENV=production \
+          #   ${{ env.BACKEND_IMAGE }}:latest
+
+      - name: Deploy Frontend to Production
+        run: |
+          echo "Deploying frontend to production environment..."
+          echo "Frontend image: ${{ env.FRONTEND_IMAGE }}:latest"
+
+          # Pull the latest frontend image
+          docker pull ${{ env.FRONTEND_IMAGE }}:latest
+
+          # Deploy frontend (example commands - modify as needed)
+          # docker run -d --name gearment-frontend-prod \
+          #   -p 80:3000 \
+          #   -e NEXT_PUBLIC_API_URL=${{ env.NEXT_PUBLIC_API_URL }} \
+          #   ${{ env.FRONTEND_IMAGE }}:latest
+
+      - name: Verify Production Deployment
+        run: |
+          echo "Verifying production deployment..."
+          echo "Backend should be running on port 3000"
+          echo "Frontend should be running on port 80"
+          # Add health checks here if needed

@@ -1,0 +1,45 @@
+# Dependencies
+node_modules
+pnpm-debug.log
+npm-debug.log
+
+# Build output
+dist
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Testing
+coverage
+.nyc_output
+test
+**/*.test.ts
+**/*.spec.ts
+
+# Development files
+.git
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+
+# CI/CD
+.drone.yml
+.github
+.gitlab-ci.yml
+
+# Logs and temp files
+*.log
+*.local
+.DS_Store
+
+# IDE
+.vscode
+.idea
+
+# Misc
+drone 
