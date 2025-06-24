@@ -1,0 +1,69 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: gearment-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gearment
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 12345678
+    ports:
+      - "6002:5432"
+    volumes:
+      - /volume1/docker/Gearment/postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - gearment-network-prod
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # NestJS Backend
+  backend:
+    image: registry.gitlab.com/zengratul/gearment/backend:latest
+    container_name: gearment-backend-prod
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=5001
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=12345678
+      - DB_NAME=gearment
+      - JWT_SECRET=vietdeptrai
+      - JWT_EXPIRES_IN=24h
+      - CORS_ORIGINS=https://gearment-fe.minhviet.xyz,http://localhost:3000,http://localhost:6000
+    ports:
+      - "6001:5001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gearment-network-prod
+
+  # Next.js Frontend
+  frontend:
+    image: registry.gitlab.com/zengratul/gearment/frontend:latest
+    container_name: gearment-frontend-prod
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=https://gearment-be.minhviet.xyz/api
+    ports:
+      - "6000:3000"
+    depends_on:
+      - backend
+    networks:
+      - gearment-network-prod
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  gearment-network-prod:
+    driver: bridge
