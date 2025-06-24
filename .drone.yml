@@ -1,0 +1,340 @@
+kind: pipeline
+type: docker
+name: ci-cd
+
+# Global environment variables
+environment:
+  REGISTRY_URL: ghcr.io
+  DOCKER_BUILDKIT: 1
+  NEXT_PUBLIC_API_URL: https://gearment-be.minhviet.xyz/api
+
+# Disable default clone to use custom clone step
+clone:
+  disable: false
+
+steps:
+  # Debug step to show pipeline information
+  - name: debug-pipeline
+    image: alpine:latest
+    commands:
+      - echo "=== Drone CI Pipeline Debug ==="
+      - 'echo "Build number: $DRONE_BUILD_NUMBER"'
+      - 'echo "Branch: $DRONE_BRANCH"'
+      - 'echo "Commit SHA: $DRONE_COMMIT_SHA"'
+      - 'echo "Repository: $DRONE_REPO"'
+      - 'echo "Author: $DRONE_COMMIT_AUTHOR"'
+      - 'echo "Event: $DRONE_BUILD_EVENT"'
+      - 'echo "Registry URL: $REGISTRY_URL"'
+      - 'echo "API URL: $NEXT_PUBLIC_API_URL"'
+      - echo "============================="
+    when:
+      branch:
+        - main
+        - master
+        - develop
+      event:
+        - push
+        - pull_request
+
+  # Test Backend
+  - name: test-backend
+    image: node:20-alpine
+    environment:
+      PNPM_HOME: /pnpm
+    commands:
+      - set -euxo pipefail
+      - export PATH="$PNPM_HOME:$PATH"
+      - echo "PATH=$PATH"
+      - corepack enable
+      - corepack prepare pnpm@latest --activate
+      - pnpm --version
+      - pnpm config set store-dir /pnpm-store
+      - pnpm config set enable-pre-post-scripts true
+      - cd backend
+      - pnpm install --frozen-lockfile
+      - pnpm run test:coverage
+    when:
+      branch: [main, master, develop]
+      event: [push, pull_request]
+
+  # Test Frontend
+  - name: test-frontend
+    image: node:20-alpine
+    environment:
+      PNPM_HOME: /pnpm
+    commands:
+      - set -euxo pipefail
+      - export PATH="$PNPM_HOME:$PATH"
+      - corepack enable
+      - corepack prepare pnpm@latest --activate
+      - pnpm --version
+      - pnpm config set store-dir /pnpm-store
+      - pnpm config set enable-pre-post-scripts true
+      - cd frontend
+      - pnpm install --frozen-lockfile
+      - pnpm run test:coverage
+    when:
+      branch: [main, master, develop]
+      event: [push, pull_request]
+
+  # Build Backend Docker Image
+  - name: build-backend
+    image: plugins/docker
+    settings:
+      registry: ghcr.io
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+      repo: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend
+      context: ./backend
+      dockerfile: ./backend/Dockerfile
+      tags:
+        - latest
+        - ${DRONE_COMMIT_SHA:0:8}
+        - ${DRONE_BRANCH}
+      buildx: true
+      cache_from:
+        - type=registry,ref=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:buildcache
+      cache_to:
+        - type=registry,ref=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:buildcache,mode=max
+      build_args:
+        - BUILDKIT_INLINE_CACHE=1
+    when:
+      branch:
+        - main
+        - master
+        - develop
+      event:
+        - push
+        - pull_request
+    depends_on:
+      - test-backend
+
+  # Build Frontend Docker Image
+  - name: build-frontend
+    image: plugins/docker
+    settings:
+      registry: ghcr.io
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+      repo: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend
+      context: ./frontend
+      dockerfile: ./frontend/Dockerfile
+      tags:
+        - latest
+        - ${DRONE_COMMIT_SHA:0:8}
+        - ${DRONE_BRANCH}
+      buildx: true
+      cache_from:
+        - type=registry,ref=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:buildcache
+      cache_to:
+        - type=registry,ref=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:buildcache,mode=max
+      build_args:
+        - BUILDKIT_INLINE_CACHE=1
+        - NEXT_PUBLIC_API_URL=https://gearment-be.minhviet.xyz/api
+        - NODE_ENV=production
+    when:
+      branch:
+        - main
+        - master
+        - develop
+      event:
+        - push
+        - pull_request
+    depends_on:
+      - test-frontend
+
+  # Security scanning with Trivy
+  - name: security-scan
+    image: aquasec/trivy:latest
+    environment:
+      GHCR_USERNAME:
+        from_secret: ghcr_username
+      GHCR_TOKEN:
+        from_secret: ghcr_token
+    commands:
+      - echo "Starting security scan..."
+      - echo "Scanning backend image for vulnerabilities..."
+      - trivy image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --username "$GHCR_USERNAME" --password "$GHCR_TOKEN" ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8} || true
+      - echo "Scanning frontend image for vulnerabilities..."
+      - trivy image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --username "$GHCR_USERNAME" --password "$GHCR_TOKEN" ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8} || true
+      - echo "Security scan completed"
+    when:
+      branch:
+        - main
+        - master
+        - develop
+      event:
+        - push
+    depends_on:
+      - build-backend
+      - build-frontend
+
+  # Deploy to Development Environment
+  - name: deploy-dev
+    image: alpine:latest
+    environment:
+      DEPLOY_HOST:
+        from_secret: dev_deploy_host
+      DEPLOY_USER:
+        from_secret: dev_deploy_user
+      DEPLOY_KEY:
+        from_secret: dev_deploy_key
+      GHCR_USERNAME:
+        from_secret: ghcr_username
+      GHCR_TOKEN:
+        from_secret: ghcr_token
+    commands:
+      - echo "Deploying to development environment..."
+      - apk add --no-cache openssh-client docker-compose
+      - echo "Setting up SSH key..."
+      - mkdir -p ~/.ssh
+      - echo "$DEPLOY_KEY" > ~/.ssh/id_rsa
+      - chmod 600 ~/.ssh/id_rsa
+      - ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+      - 'echo "Deploying backend image: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8}"'
+      - 'echo "Deploying frontend image: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8}"'
+      - echo "SSH to server and update containers..."
+      - |
+        ssh -i ~/.ssh/id_rsa $DEPLOY_USER@$DEPLOY_HOST << EOF
+          cd /opt/gearment
+          echo $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USERNAME --password-stdin
+          export BACKEND_IMAGE=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8}
+          export FRONTEND_IMAGE=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8}
+          docker-compose -f docker-compose.dev.yml pull
+          docker-compose -f docker-compose.dev.yml up -d
+          docker system prune -f
+        EOF
+      - echo "Development deployment completed"
+    when:
+      branch:
+        - develop
+      event:
+        - push
+    depends_on:
+      - build-backend
+      - build-frontend
+      - security-scan
+
+  # Deploy to Production Environment
+  - name: deploy-prod
+    image: alpine:latest
+    environment:
+      DEPLOY_HOST:
+        from_secret: prod_deploy_host
+      DEPLOY_USER:
+        from_secret: prod_deploy_user
+      DEPLOY_KEY:
+        from_secret: prod_deploy_key
+      GHCR_USERNAME:
+        from_secret: ghcr_username
+      GHCR_TOKEN:
+        from_secret: ghcr_token
+    commands:
+      - echo "Deploying to production environment..."
+      - apk add --no-cache openssh-client docker-compose
+      - echo "Setting up SSH key..."
+      - mkdir -p ~/.ssh
+      - echo "$DEPLOY_KEY" > ~/.ssh/id_rsa
+      - chmod 600 ~/.ssh/id_rsa
+      - ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+      - 'echo "Deploying backend image: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8}"'
+      - 'echo "Deploying frontend image: ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8}"'
+      - echo "SSH to server and update containers..."
+      - |
+        ssh -i ~/.ssh/id_rsa $DEPLOY_USER@$DEPLOY_HOST << EOF
+          cd /opt/gearment
+          echo $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USERNAME --password-stdin
+          export BACKEND_IMAGE=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8}
+          export FRONTEND_IMAGE=ghcr.io/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8}
+          docker-compose -f docker-compose.prod.yml pull
+          docker-compose -f docker-compose.prod.yml up -d
+          docker system prune -f
+        EOF
+      - echo "Production deployment completed"
+    when:
+      branch:
+        - main
+        - master
+      event:
+        - push
+    depends_on:
+      - build-backend
+      - build-frontend
+      - security-scan
+
+# Trigger conditions
+trigger:
+  branch:
+    - main
+    - master
+    - develop
+  event:
+    - push
+    - pull_request
+
+# ---
+# # Second pipeline for manual deployments
+# kind: pipeline
+# type: docker
+# name: manual-deploy
+
+# steps:
+#   - name: manual-deploy-prod
+#     image: alpine:latest
+#     environment:
+#       DEPLOY_HOST:
+#         from_secret: prod_deploy_host
+#       DEPLOY_USER:
+#         from_secret: prod_deploy_user
+#       DEPLOY_KEY:
+#         from_secret: prod_deploy_key
+#       GHCR_USERNAME:
+#         from_secret: ghcr_username
+#       GHCR_TOKEN:
+#         from_secret: ghcr_token
+#     commands:
+#       - echo "Manual production deployment triggered..."
+#       - apk add --no-cache openssh-client docker-compose
+#       - mkdir -p ~/.ssh
+#       - echo "$DEPLOY_KEY" > ~/.ssh/id_rsa
+#       - chmod 600 ~/.ssh/id_rsa
+#       - ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+#       - |
+#         ssh -i ~/.ssh/id_rsa $DEPLOY_USER@$DEPLOY_HOST << EOF
+#           cd /opt/gearment
+#           echo $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USERNAME --password-stdin
+#           docker-compose -f docker-compose.prod.yml pull
+#           docker-compose -f docker-compose.prod.yml up -d
+#           docker system prune -f
+#         EOF
+#       - echo "Manual deployment completed"
+
+# trigger:
+#   event:
+#     - promote
+#   target:
+#     - production
+
+---
+# Pipeline for cleanup old images
+kind: pipeline
+type: docker
+name: cleanup
+
+steps:
+  - name: cleanup-old-images
+    image: alpine:latest
+    commands:
+      - echo "Cleaning up old Docker images..."
+      - echo "This step would clean up old images from registry"
+      - echo "Implementation depends on your registry type"
+
+trigger:
+  event:
+    - cron
+  cron:
+    - cleanup
